@@ -3,6 +3,8 @@ import { StrategyParams } from '../shared/types';
 interface TelegramConfig {
   botToken: string;
   chatId: string;
+  /** Optional forum topic id — sent as message_thread_id when set. */
+  threadId?: number;
 }
 
 interface OKXConfig {
@@ -18,36 +20,30 @@ interface Config {
 }
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8676131339:AAEgELictVPNdFP-TH2yvzY1nhjhtjc8VCc';
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '-5110607640';
-// const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '784302988';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '-1002990350274';
+// Optional forum topic id (message_thread_id). Leave undefined to post to the main chat.
+const TELEGRAM_THREAD_ID = process.env.TELEGRAM_THREAD_ID
+  ? parseInt(process.env.TELEGRAM_THREAD_ID, 10)
+  : undefined;
 
 const CONFIG: Config = {
   telegram: {
     botToken: TELEGRAM_BOT_TOKEN,
     chatId: TELEGRAM_CHAT_ID,
+    threadId: TELEGRAM_THREAD_ID,
   },
 
+  // BTC H4 RR1 decision-tree model params. TP/SL are a fixed USD distance (R:R 1:1).
   strategy: {
-    volLength: 20,
-    volMultiplier: 1.5,
-    absorbBodyRatio: 0.35,
-    absorbMinBars: 2,
-    absorbLookback: 10,
-    accumLength: 5,
-    accumATRMult: 0.8,
-    aggrVolMult: 1.3,
-    aggrBodyRatio: 0.6,
-    aggrBreakMargin: 0.1,
-    atrLength: 14,
-    slMultiplier: 1.5,
-    rrRatio: 1.0,
-    minSLPercent: 1.0,
-    maxSLPercent: 5.0,
-    simpleMode: true,
+    tpSlDistance: 800,
+    extraTpDistance: 500,
+    buyThreshold: 0.98,
+    sellThreshold: 0.02,
+    emaWarmup: 210,
   },
 
-  tokens: ['BTC', 'ETH', 'SOL'],
-  timeframes: ['1H', '4H'],
+  tokens: ['BTC'],
+  timeframes: ['4H'],
 
   okx: {
     apiUrl: 'https://www.okx.com/api/v5',

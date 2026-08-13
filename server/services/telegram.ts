@@ -3,10 +3,13 @@ import { formatTimeLog } from '../../shared/time';
 
 const MAX_MSG_LENGTH = 4000;
 
-function sendSingleMessage(text: string, botToken: string, chatId: string): Promise<void> {
+function sendSingleMessage(text: string, botToken: string, chatId: string, threadId?: number): Promise<void> {
   return new Promise((resolve) => {
     const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-    const data = JSON.stringify({ chat_id: chatId, text });
+    const payload: Record<string, unknown> = { chat_id: chatId, text };
+    // Forum topic id — only set when configured, otherwise post to the main chat.
+    if (threadId !== undefined) payload.message_thread_id = threadId;
+    const data = JSON.stringify(payload);
 
     const options: https.RequestOptions = {
       method: 'POST',
@@ -49,7 +52,7 @@ function sendSingleMessage(text: string, botToken: string, chatId: string): Prom
   });
 }
 
-export async function sendMessage(text: string, botToken: string, chatId: string): Promise<void> {
+export async function sendMessage(text: string, botToken: string, chatId: string, threadId?: number): Promise<void> {
   if (!botToken || !chatId) {
     console.log(`[${formatTimeLog()}] [TELEGRAM] Missing botToken or chatId`);
     return;
@@ -59,7 +62,7 @@ export async function sendMessage(text: string, botToken: string, chatId: string
 
   // Split if message too long
   if (text.length <= MAX_MSG_LENGTH) {
-    await sendSingleMessage(text, botToken, chatId);
+    await sendSingleMessage(text, botToken, chatId, threadId);
     return;
   }
 
@@ -69,7 +72,7 @@ export async function sendMessage(text: string, botToken: string, chatId: string
 
   for (const part of parts) {
     if (chunk.length + part.length + 2 > MAX_MSG_LENGTH && chunk.length > 0) {
-      await sendSingleMessage(chunk, botToken, chatId);
+      await sendSingleMessage(chunk, botToken, chatId, threadId);
       chunk = part;
     } else {
       chunk = chunk ? chunk + '\n\n' + part : part;
@@ -77,6 +80,6 @@ export async function sendMessage(text: string, botToken: string, chatId: string
   }
 
   if (chunk.length > 0) {
-    await sendSingleMessage(chunk, botToken, chatId);
+    await sendSingleMessage(chunk, botToken, chatId, threadId);
   }
 }

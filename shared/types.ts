@@ -23,30 +23,23 @@ export interface Signal {
 }
 
 export interface StrategyParams {
-  volLength: number;
-  volMultiplier: number;
-  absorbBodyRatio: number;
-  absorbMinBars: number;
-  absorbLookback: number;
-  accumLength: number;
-  accumATRMult: number;
-  aggrVolMult: number;
-  aggrBodyRatio: number;
-  aggrBreakMargin: number;
-  atrLength: number;
-  slMultiplier: number;
-  rrRatio: number;
-  minSLPercent: number;
-  maxSLPercent: number;
-  simpleMode: boolean;
+  /** Fixed TP & SL price distance in USD (R:R 1:1). Default 800. */
+  tpSlDistance: number;
+  /** Extra distance added for TP2 and TP3 in the Telegram message. Default 500. */
+  extraTpDistance: number;
+  /** Long-probability threshold at/above which a BUY fires. Default 0.98. */
+  buyThreshold: number;
+  /** Long-probability threshold at/below which a SELL fires. Default 0.02. */
+  sellThreshold: number;
+  /** Minimum bars required before the model runs (EMA200 warmup). Default 210. */
+  emaWarmup: number;
 }
 
 export interface DetectorState {
-  absorptionCount: number;
-  lastAbsorptionBar: number;
-  inAccumulation: boolean;
-  accumHigh: number | null;
-  accumLow: number | null;
-  accumStartBar: number;
-  lastSimpleSignalBar: number | null;
+  inTrade: boolean;
+  isLong: boolean;
+  entryPrice: number | null;
+  stopPrice: number | null;
+  targetPrice: number | null;
+  entryBar: number | null;
 }

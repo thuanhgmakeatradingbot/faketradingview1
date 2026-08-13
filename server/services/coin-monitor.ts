@@ -1,7 +1,6 @@
-import { SignalDetector3A, SignalResult } from '../../shared/signal-detector';
+import { SignalDetectorBTCH4, SignalResult } from '../../shared/signal-detector';
 import { CandleData, Signal } from '../../shared/types';
 import { formatTimeLog } from '../../shared/time';
-import { aggregateCandles } from '../../shared/candle-aggregator';
 import OKXClient from './okx-client';
 import { saveSignal, loadSignals, updateSignalResult, DBSignal } from './signal-db';
 
@@ -33,7 +32,7 @@ class CoinMonitor {
   config: any;
   okxClient: OKXClient;
   timeframes: string[];
-  detectors: Record<string, SignalDetector3A>;
+  detectors: Record<string, SignalDetectorBTCH4>;
   data: Record<string, CandleData[]>;
   onSignal: OnSignalCallback | null;
   winrateStats: WinrateStats;
@@ -43,14 +42,14 @@ class CoinMonitor {
     this.symbol = `${coin}-USDT-SWAP`;
     this.config = config;
     this.okxClient = new OKXClient();
-    this.timeframes = ['1H', '4H'];
+    this.timeframes = ['4H'];
     this.detectors = {};
-    this.data = { '1H': [], '4H': [] };
+    this.data = { '4H': [] };
     this.onSignal = onSignal;
     this.winrateStats = { total: 0, tp1Hit: 0, tp2Hit: 0, tp3Hit: 0, slHit: 0, pending: 0 };
 
     this.timeframes.forEach(tf => {
-      this.detectors[tf] = new SignalDetector3A(config.strategy);
+      this.detectors[tf] = new SignalDetectorBTCH4(config.strategy);
     });
   }
 
@@ -62,13 +61,12 @@ class CoinMonitor {
 
   async fetchHistoricalData(): Promise<void> {
     try {
-      // Fetch 300 1H candles — enough for 75 closed 4H bars after aggregation
-      const candles1H = await this.okxClient.getCandles(this.symbol, '1H', '300');
-      this.data['1H'] = candles1H;
-      // Build 4H from 1H so we only need one API call per coin
-      this.data['4H'] = aggregateCandles(candles1H, '4H');
+      // Fetch 300 4H candles directly — the model needs EMA200 + lookback[34]
+      // warmup, so aggregating from 300 1H bars (only ~75 4H) is not enough.
+      const candles4H = await this.okxClient.getCandles(this.symbol, '4H', '300');
+      this.data['4H'] = candles4H;
 
-      console.log(`[${formatTimeLog()}] [FETCH] ${this.symbol}: ${candles1H.length} 1H → ${this.data['4H'].length} 4H candles (aggregated)`);
+      console.log(`[${formatTimeLog()}] [FETCH] ${this.symbol}: ${candles4H.length} 4H candles`);
     } catch (error: any) {
       // Re-throw so callers know the fetch failed — don't silently leave
       // this.data empty, which would cause the replay to skip all timeframes
@@ -83,19 +81,20 @@ class CoinMonitor {
     const detectedAt = Date.now();
     const tfs = timeframesToScan ?? this.timeframes;
 
+    const warmup = this.config.strategy?.emaWarmup ?? 210;
     tfs.forEach(tf => {
       // Exclude the last candle — OKX always returns the currently-forming candle
       // as the final entry, so its close/volume data is incomplete.
       const candles = this.data[tf].slice(0, -1);
-      if (!candles || candles.length < 50) {
-        if (verbose) console.log(`  ${tf}: Not enough candles (${candles?.length || 0}), skipping`);
+      if (!candles || candles.length < warmup) {
+        if (verbose) console.log(`  ${tf}: Not enough candles (${candles?.length || 0}/${warmup}), skipping`);
         return;
       }
 
-      this.detectors[tf] = new SignalDetector3A(this.config.strategy);
+      this.detectors[tf] = new SignalDetectorBTCH4(this.config.strategy);
 
       let signalCount = 0;
-      for (let i = 50; i <= candles.length; i++) {
+      for (let i = warmup; i <= candles.length; i++) {
         const slice = candles.slice(0, i);
         const signal = this.detectors[tf].detectSignals(slice);
         if (signal) {
@@ -179,9 +178,9 @@ class CoinMonitor {
       const s = latest[0];
       const emoji = s.type === 'BUY' ? '🟢' : '🔴';
       const dir = s.type === 'BUY' ? 1 : -1;
-      const dist = Math.abs(s.entry - s.tp);
-      const tp2 = s.entry + dir * 2 * dist;
-      const tp3 = s.entry + dir * 3 * dist;
+      const extra = this.config.strategy?.extraTpDistance ?? 500;
+      const tp2 = s.tp + dir * extra;
+      const tp3 = tp2 + dir * extra;
       const coin = s.symbol.replace('-USDT-SWAP', '');
       console.log(`  ${emoji} ${coin} ${s.timeframe} ${s.type} | Entry $${s.entry.toFixed(2)} | SL $${s.sl.toFixed(2)} | TP1 $${s.tp.toFixed(2)} | TP2 $${tp2.toFixed(2)} | TP3 $${tp3.toFixed(2)} | ${formatTimeLog(s.timestamp)}`);
     } else {
@@ -262,12 +261,12 @@ class CoinMonitor {
       }
 
       stats.total++;
-      const distance = Math.abs(sig.entry - sig.tp);
       const dir = sig.type === 'BUY' ? 1 : -1;
+      const extra = this.config.strategy?.extraTpDistance ?? 500;
       const sl = sig.sl;
       const tp1 = sig.tp;
-      const tp2 = sig.entry + dir * 2 * distance;
-      const tp3 = sig.entry + dir * 3 * distance;
+      const tp2 = tp1 + dir * extra;
+      const tp3 = tp2 + dir * extra;
 
       let tp1Reached = false;
       let tp2Reached = false;

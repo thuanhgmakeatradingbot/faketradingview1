@@ -37,58 +37,30 @@ function getAggregatedWinrate(): WinrateStats {
 }
 
 function formatSignalForTelegram(signal: SignalRecord, stats: WinrateStats, coin: string): string {
-  const direction = signal.type === 'BUY' ? '🟢 LONG' : '🔴 SHORT';
-  const symbolClean = signal.symbol.replace('-SWAP', '').replace('-', '');
-  const score = signal.score || 6;
-  const starCount = Math.max(1, Math.round(score / 2));
-  const stars = '⭐️'.repeat(starCount);
-  const confidence = `${stars} ${score}/10`;
+  const isBuy = signal.type === 'BUY';
+  const directionIcon = isBuy ? '🟢' : '🔴';
+  const directionText = isBuy ? 'BUY' : 'SELL';
+  const symbolClean = signal.symbol.replace('-USDT-SWAP', '') + 'USDT';
 
   const entry = signal.entry;
   const sl = signal.sl;
-  const riskPercent = parseFloat(signal.risk) || Math.abs((entry - sl) / entry * 100);
-  const rrRatio = CONFIG.strategy.rrRatio || 1.0;
-
   const tp1 = signal.tp;
-  const distance = Math.abs(entry - tp1);
-  const dir = signal.type === 'BUY' ? 1 : -1;
-  const tp2 = entry + dir * 2 * distance;
-  const tp3 = entry + dir * 3 * distance;
-  const tp1Distance = (distance / entry) * 100;
-  const tp2Distance = (Math.abs(entry - tp2) / entry) * 100;
-  const tp3Distance = (Math.abs(entry - tp3) / entry) * 100;
+  const extra = CONFIG.strategy.extraTpDistance ?? 500;
+  const dir = isBuy ? 1 : -1;
+  const tp2 = tp1 + dir * extra;
+  const tp3 = tp2 + dir * extra;
 
-  const candleCloseStr = formatTimeTelegram(signal.timestamp + getTimeframeDurationMs(signal.timeframe));
-
-  const tp1Pct = stats.total > 0 ? ((stats.tp1Hit / stats.total) * 100).toFixed(0) : '0';
-  const tp2Pct = stats.total > 0 ? ((stats.tp2Hit / stats.total) * 100).toFixed(0) : '0';
-  const tp3Pct = stats.total > 0 ? ((stats.tp3Hit / stats.total) * 100).toFixed(0) : '0';
-  const winrateLine = `TP1: ${tp1Pct}%🟡 | TP2: ${tp2Pct}%🔴 | TP3: ${tp3Pct}%🔴`;
-
-  let message = `${direction} ${symbolClean} — ${confidence}\n\n`;
-  message += `💰 Entry : ${entry.toFixed(2)}\n`;
-  message += `🛑 SL    : ${sl.toFixed(2)} (${riskPercent.toFixed(2)}%)\n`;
-  message += `🎯 TP1   : ${tp1.toFixed(2)} (${tp1Distance.toFixed(2)}%)\n`;
-  message += `🎯 TP2   : ${tp2.toFixed(2)} (${tp2Distance.toFixed(2)}%)\n`;
-  message += `🎯 TP3   : ${tp3.toFixed(2)} (${tp3Distance.toFixed(2)}%)\n\n`;
-  message += `⏱️ Timeframe : ${signal.timeframe}\n`;
-  message += `📐 R:R       : 1:${rrRatio.toFixed(1)}\n\n`;
-  message += `─ Winrate Stats (${coin}) ─\n`;
-  message += `${winrateLine}\n`;
-  message += `Based on ${stats.total} signals\n\n`;
-  message += `─ ─ ─\n`;
-
-  // Late signal detection warning (delay measured from candle CLOSE, not open)
-  const detectedAt = signal.detectedAt || signal.timestamp;
-  const candleCloseTime = signal.timestamp + getTimeframeDurationMs(signal.timeframe);
-  const delayMs = detectedAt - candleCloseTime;
-  const delayMin = Math.round(delayMs / 60000);
-  if (delayMin >= 5) {
-    message += `⚠️ Late signal — detected ${delayMin}min after candle close\n`;
-    message += `🕐 Candle Closed At: ${candleCloseStr} | Detected: ${formatTimeTelegram(detectedAt)}`;
-  } else {
-    message += `🕐 Candle Closed At: ${candleCloseStr}`;
-  }
+  // "PHƯỚC BÁU" format (ported from the Pine telegram_payload).
+  let message = `📌 PHƯỚC BÁU SIGNAL\n━━━━━━━━━━━\n\n`;
+  message += `${directionIcon} ${directionText} ${symbolClean}\n`;
+  message += `📍 Entry: ${entry.toFixed(2)}\n`;
+  message += `🛑 SL: ${sl.toFixed(2)}\n`;
+  message += `🎯 TP:\n`;
+  message += `       TP 1: ${tp1.toFixed(2)}\n`;
+  message += `       TP 2: ${tp2.toFixed(2)}\n`;
+  message += `       TP 3: ${tp3.toFixed(2)}\n\n`;
+  message += `💰 Vốn: max 2%/ lệnh\n\n`;
+  message += `🔖 PB Research – AI phân tích, không phải lời khuyên đầu tư.`;
 
   return message;
 }
@@ -124,30 +96,7 @@ async function handleSignalDetected(signal: SignalRecord): Promise<void> {
   const stats = mon ? mon.winrateStats : getAggregatedWinrate();
   const coin = mon ? mon.coin : signal.symbol.replace('-USDT-SWAP', '');
   const message = formatSignalForTelegram(signal, stats, coin);
-  await sendMessage(message, CONFIG.telegram.botToken, CONFIG.telegram.chatId);
-}
-
-async function sendStartupSummary(): Promise<void> {
-  // Pull the latest 6 signals from the DB, sorted by candle time desc.
-  const latest = getLatestSignals(6);
-
-  if (latest.length === 0) {
-    await sendMessage('📋 Bot started — no signals in DB.', CONFIG.telegram.botToken, CONFIG.telegram.chatId);
-    startupSignals = [];
-    return;
-  }
-
-  // One short line per signal:  🟢 BTC 1H BUY 50000 [tp1] Closed: Apr 27, 2026 16:00
-  const lines = latest.map(s => {
-    const arrow = s.type === 'BUY' ? '🟢' : '🔴';
-    const coin = s.symbol.replace('-USDT-SWAP', '');
-    const closeStr = formatTimeTelegram(s.timestamp + getTimeframeDurationMs(s.timeframe));
-    return `${arrow} ${coin} ${s.timeframe} ${s.type} ${s.entry.toFixed(2)} [${s.result}] Closed: ${closeStr}`;
-  });
-  const fullMessage = `📋 Bot started — latest ${latest.length}:\n${lines.join('\n')}`;
-
-  await sendMessage(fullMessage, CONFIG.telegram.botToken, CONFIG.telegram.chatId);
-  startupSignals = [];
+  await sendMessage(message, CONFIG.telegram.botToken, CONFIG.telegram.chatId, CONFIG.telegram.threadId);
 }
 
 (async () => {
@@ -173,18 +122,24 @@ async function sendStartupSummary(): Promise<void> {
     }
   }
 
-  // All monitors done scanning — send the 3 latest signals to Telegram
+  // All monitors done scanning. Startup summary to Telegram is disabled —
+  // only real signals are pushed.
   isStartupPhase = false;
-  await sendStartupSummary();
+  startupSignals = [];
 
-  // Fire at HH:00:01 every hour — 1 second after the 1H candle closes.
-  // 4H candles (UTC-aligned) close every 4 UTC hours; detect that via utcHour % 4 === 0.
+  // Fire at HH:00:01 every hour. The model is BTC H4-only, so we only scan when
+  // a 4H candle has just closed. 4H candles (UTC-aligned) close every 4 UTC hours
+  // (00:00, 04:00, 08:00, ...); detect that via utcHour % 4 === 0.
   cron.schedule('1 0 * * * *', async () => {
     const utcHour = new Date().getUTCHours();
     const is4HClose = utcHour % 4 === 0;
-    const timeframesToScan = is4HClose ? ['1H', '4H'] : ['1H'];
+    if (!is4HClose) {
+      // Not a 4H boundary — nothing to do for a 4H-only strategy.
+      return;
+    }
+    const timeframesToScan = ['4H'];
 
-    console.log(`[${refreshCount}] [${formatTimeLog()}] Hourly refresh — scanning ${timeframesToScan.join(', ')}${is4HClose ? ' (4H candle closed)' : ''}...`);
+    console.log(`[${refreshCount}] [${formatTimeLog()}] 4H candle closed — scanning ${timeframesToScan.join(', ')}...`);
 
     let totalSaved = 0;
     for (const monitor of monitors) {
@@ -275,20 +230,8 @@ async function sendStartupSummary(): Promise<void> {
   });
 
   async function shutdownHandler(signalName: string) {
-    console.log(`[END BOT] [${formatTimeLog()}] Shutting down...`);
-
-    const endMessage = `🔴 3A Strategy Bot Stopped
-
-📅 ${formatTimeLog()}
-
-📊 Monitors: ${monitors.length}
-📈 Signals detected: ${totalSignalsDetected}
-⏱️ Last refresh: #${refreshCount}
-
-🔄 Bot stopped by ${signalName} signal`;
-
-    await sendMessage(endMessage, CONFIG.telegram.botToken, CONFIG.telegram.chatId);
-
+    console.log(`[END BOT] [${formatTimeLog()}] Shutting down (${signalName})...`);
+    // Start/stop Telegram notifications are disabled — no message sent on shutdown.
     server.close();
     monitors.forEach(m => m.stop());
     process.exit(0);

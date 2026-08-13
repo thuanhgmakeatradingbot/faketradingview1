@@ -1,4 +1,5 @@
 import { CandleData, DetectorState, StrategyParams } from './types';
+import { computeFeatures, longProbability, MIN_BARS } from './btc-h4-model';
 
 export interface SignalResult {
   type: 'BUY' | 'SELL';
@@ -13,300 +14,128 @@ export interface SignalResult {
   score: number;
 }
 
-export class SignalDetector3A {
+/**
+ * BTC H4 RR1 signal detector — decision-tree model ported from the Pine v6
+ * indicator "PB OKX BTC H4 RR1 Optimized".
+ *
+ * State machine (mirrors the Pine `in_trade` logic): at most one open trade at
+ * a time. On each confirmed bar, first check whether the open trade hit SL/TP;
+ * only when flat may a new BUY/SELL open. SL/TP use a fixed USD distance (R:R 1:1).
+ *
+ * The detector is stateful across calls — CoinMonitor replays growing candle
+ * slices bar-by-bar through a single instance, so `entryBar` comparisons hold.
+ */
+export class SignalDetectorBTCH4 {
   private params: StrategyParams;
   private state: DetectorState;
 
   constructor(strategyConfig?: Partial<StrategyParams>) {
     this.params = {
-      volLength: strategyConfig?.volLength ?? 20,
-      volMultiplier: strategyConfig?.volMultiplier ?? 1.5,
-      absorbBodyRatio: strategyConfig?.absorbBodyRatio ?? 0.35,
-      absorbMinBars: strategyConfig?.absorbMinBars ?? 2,
-      absorbLookback: strategyConfig?.absorbLookback ?? 10,
-      accumLength: strategyConfig?.accumLength ?? 5,
-      accumATRMult: strategyConfig?.accumATRMult ?? 0.8,
-      aggrVolMult: strategyConfig?.aggrVolMult ?? 1.3,
-      aggrBodyRatio: strategyConfig?.aggrBodyRatio ?? 0.6,
-      aggrBreakMargin: strategyConfig?.aggrBreakMargin ?? 0.1,
-      atrLength: strategyConfig?.atrLength ?? 14,
-      slMultiplier: strategyConfig?.slMultiplier ?? 1.5,
-      rrRatio: strategyConfig?.rrRatio ?? 1.0,
-      minSLPercent: strategyConfig?.minSLPercent ?? 1.0,
-      maxSLPercent: strategyConfig?.maxSLPercent ?? 5.0,
-      simpleMode: strategyConfig?.simpleMode ?? true,
+      tpSlDistance: strategyConfig?.tpSlDistance ?? 800,
+      extraTpDistance: strategyConfig?.extraTpDistance ?? 500,
+      buyThreshold: strategyConfig?.buyThreshold ?? 0.98,
+      sellThreshold: strategyConfig?.sellThreshold ?? 0.02,
+      emaWarmup: strategyConfig?.emaWarmup ?? MIN_BARS,
     };
+    this.state = this.freshState();
+  }
 
-    this.state = {
-      absorptionCount: 0,
-      lastAbsorptionBar: 0,
-      inAccumulation: false,
-      accumHigh: null,
-      accumLow: null,
-      accumStartBar: 0,
-      lastSimpleSignalBar: null,
+  private freshState(): DetectorState {
+    return {
+      inTrade: false,
+      isLong: false,
+      entryPrice: null,
+      stopPrice: null,
+      targetPrice: null,
+      entryBar: null,
     };
   }
 
-  detectSignals(candleData: CandleData[]) {
-    if (candleData.length < 50) return null;
+  detectSignals(candleData: CandleData[]): SignalResult | null {
+    if (candleData.length < this.params.emaWarmup) return null;
 
-    const current = candleData[candleData.length - 1];
     const barIndex = candleData.length - 1;
+    const current = candleData[barIndex];
 
-    const volMA = this.calculateSMA(candleData.map(c => c.volume), this.params.volLength);
-    const atr = this.calculateATR(candleData, this.params.atrLength);
-    const ema20 = this.calculateEMA(candleData.map(c => c.close), 20);
+    const features = computeFeatures(candleData);
+    if (!features) return null;
 
-    const currentVolMA = volMA[volMA.length - 1];
-    const currentATR = atr[atr.length - 1];
-    const currentEma20 = ema20[ema20.length - 1];
+    const prob = longProbability(features);
+    const buyBias = prob >= this.params.buyThreshold;
+    const sellBias = prob <= this.params.sellThreshold;
 
-    const highVolume = current.volume > currentVolMA * this.params.volMultiplier;
-    const priceRange = current.high - current.low;
-    const bodySize = Math.abs(current.close - current.open);
-    const bodyRatio = priceRange > 0 ? bodySize / priceRange : 0;
-
-    // PHASE 1: ABSORPTION
-    const isAbsorption = highVolume &&
-      bodyRatio < this.params.absorbBodyRatio &&
-      priceRange > currentATR * 0.3;
-
-    if (isAbsorption) {
-      this.state.absorptionCount = 1;
-      for (let i = 1; i <= this.params.absorbLookback && barIndex - i >= 0; i++) {
-        const pastCandle = candleData[barIndex - i];
-        const pastVolMA = volMA[volMA.length - 1 - i];
-        const pastATR = atr[atr.length - 1 - i];
-        const pastPriceRange = pastCandle.high - pastCandle.low;
-        const pastBodySize = Math.abs(pastCandle.close - pastCandle.open);
-        const pastBodyRatio = pastPriceRange > 0 ? pastBodySize / pastPriceRange : 0;
-        const pastHighVolume = pastCandle.volume > pastVolMA * this.params.volMultiplier;
-        const pastIsAbsorption = pastHighVolume &&
-          pastBodyRatio < this.params.absorbBodyRatio &&
-          pastPriceRange > pastATR * 0.3;
-
-        if (pastIsAbsorption) this.state.absorptionCount++;
-      }
-      this.state.lastAbsorptionBar = barIndex;
-    }
-
-    const hasAbsorption = this.state.absorptionCount >= this.params.absorbMinBars &&
-      (barIndex - this.state.lastAbsorptionBar) <= this.params.absorbLookback;
-
-    // PHASE 2: ACCUMULATION
-    const rangeHigh = Math.max(...candleData.slice(-this.params.accumLength).map(c => c.high));
-    const rangeLow = Math.min(...candleData.slice(-this.params.accumLength).map(c => c.low));
-    const rangeSize = rangeHigh - rangeLow;
-    const isAccumulating = rangeSize < currentATR * this.params.accumATRMult;
-
-    if (hasAbsorption && isAccumulating && !this.state.inAccumulation) {
-      this.state.inAccumulation = true;
-      this.state.accumHigh = rangeHigh;
-      this.state.accumLow = rangeLow;
-      this.state.accumStartBar = barIndex;
-    }
-
-    if (this.state.inAccumulation && this.state.accumHigh !== null && this.state.accumLow !== null) {
-      this.state.accumHigh = Math.max(this.state.accumHigh, current.high);
-      this.state.accumLow = Math.min(this.state.accumLow, current.low);
-
-      if ((this.state.accumHigh - this.state.accumLow) > currentATR * this.params.accumATRMult * 2.0 ||
-        (barIndex - this.state.accumStartBar) > this.params.accumLength * 3) {
-        this.state.inAccumulation = false;
-        this.state.accumHigh = null;
-        this.state.accumLow = null;
+    // 1) If a trade is open, check whether THIS bar closed it (SL or TP hit).
+    let closedThisBar = false;
+    if (this.state.inTrade && this.state.entryBar !== null && barIndex > this.state.entryBar) {
+      const hitSL = this.state.isLong
+        ? current.low <= (this.state.stopPrice as number)
+        : current.high >= (this.state.stopPrice as number);
+      const hitTP = this.state.isLong
+        ? current.high >= (this.state.targetPrice as number)
+        : current.low <= (this.state.targetPrice as number);
+      if (hitSL || hitTP) {
+        this.state.inTrade = false;
+        closedThisBar = true;
       }
     }
 
-    // PHASE 3: AGGRESSION
-    const breakMargin = currentATR * this.params.aggrBreakMargin;
+    // 2) Only open a new trade when flat (and not on the same bar one just closed).
+    const canOpen = !this.state.inTrade && !closedThisBar;
+    const dist = this.params.tpSlDistance;
 
-    const bullishAggression = this.state.inAccumulation && this.state.accumHigh !== null &&
-      current.close > this.state.accumHigh + breakMargin &&
-      current.volume > currentVolMA * this.params.aggrVolMult &&
-      bodyRatio > this.params.aggrBodyRatio &&
-      current.close > current.open;
-
-    const bearishAggression = this.state.inAccumulation && this.state.accumLow !== null &&
-      current.close < this.state.accumLow! - breakMargin &&
-      current.volume > currentVolMA * this.params.aggrVolMult &&
-      bodyRatio > this.params.aggrBodyRatio &&
-      current.close < current.open;
-
-    // SIGNAL GENERATION
-    let buySignal = false;
-    let sellSignal = false;
-
-    if (this.params.simpleMode) {
-      const simpleBuySignal = highVolume && bodyRatio > 0.6 && current.close > current.open && current.close > currentEma20;
-      const simpleSellSignal = highVolume && bodyRatio > 0.6 && current.close < current.open && current.close < currentEma20;
-      const canSimpleSignal = this.state.lastSimpleSignalBar === null || (barIndex - this.state.lastSimpleSignalBar) >= 3;
-
-      if (simpleBuySignal && canSimpleSignal) {
-        buySignal = true;
-        this.state.lastSimpleSignalBar = barIndex;
-      } else if (simpleSellSignal && canSimpleSignal) {
-        sellSignal = true;
-        this.state.lastSimpleSignalBar = barIndex;
-      }
-    } else {
-      if (bullishAggression) {
-        buySignal = true;
-        this.state.inAccumulation = false;
-      } else if (bearishAggression) {
-        sellSignal = true;
-        this.state.inAccumulation = false;
-      }
-    }
-
-    // POSITION & RISK MANAGEMENT
-    const volRatio = currentVolMA > 0 ? current.volume / currentVolMA : 1;
-    const trendAligned = (buySignal && current.close > currentEma20) ||
-      (sellSignal && current.close < currentEma20);
-
-    if (buySignal) {
+    if (canOpen && buyBias) {
       const entry = current.close;
-      const sl = this.params.simpleMode
-        ? current.low - (currentATR * this.params.slMultiplier)
-        : (this.state.accumLow ?? current.low) - (currentATR * this.params.slMultiplier * 0.5);
-      const tp = entry + ((entry - sl) * this.params.rrRatio);
-      const riskPercent = Math.abs((entry - sl) / entry * 100);
-
-      if (riskPercent < this.params.minSLPercent || riskPercent > this.params.maxSLPercent) return null;
-
-      return {
-        type: 'BUY' as const,
-        entry,
-        sl,
-        tp,
-        risk: riskPercent.toFixed(2),
-        conditions: this.params.simpleMode
-          ? 'Simple: High Vol + Strong Body + Trend'
-          : 'AAA: Absorption → Accumulation → Aggression',
-        pattern: this.params.simpleMode ? 'Simple 3A' : 'Full 3A',
-        phase: this.getCurrentPhase(),
-        isValid: true,
-        score: this.calculateScore(bodyRatio, volRatio, trendAligned, hasAbsorption, this.state.inAccumulation),
-      };
+      const sl = entry - dist;
+      const tp = entry + dist;
+      this.openTrade(true, entry, sl, tp, barIndex);
+      return this.buildSignal('BUY', entry, sl, tp, prob);
     }
 
-    if (sellSignal) {
+    if (canOpen && sellBias) {
       const entry = current.close;
-      const sl = this.params.simpleMode
-        ? current.high + (currentATR * this.params.slMultiplier)
-        : (this.state.accumHigh ?? current.high) + (currentATR * this.params.slMultiplier * 0.5);
-      const tp = entry - ((sl - entry) * this.params.rrRatio);
-      const riskPercent = Math.abs((sl - entry) / entry * 100);
-
-      if (riskPercent < this.params.minSLPercent || riskPercent > this.params.maxSLPercent) return null;
-
-      return {
-        type: 'SELL' as const,
-        entry,
-        sl,
-        tp,
-        risk: riskPercent.toFixed(2),
-        conditions: this.params.simpleMode
-          ? 'Simple: High Vol + Strong Body + Trend'
-          : 'AAA: Absorption → Accumulation → Aggression',
-        pattern: this.params.simpleMode ? 'Simple 3A' : 'Full 3A',
-        phase: this.getCurrentPhase(),
-        isValid: true,
-        score: this.calculateScore(bodyRatio, volRatio, trendAligned, hasAbsorption, this.state.inAccumulation),
-      };
+      const sl = entry + dist;
+      const tp = entry - dist;
+      this.openTrade(false, entry, sl, tp, barIndex);
+      return this.buildSignal('SELL', entry, sl, tp, prob);
     }
 
     return null;
   }
 
-  setSimpleMode(enabled: boolean): void {
-    this.params.simpleMode = enabled;
+  private openTrade(isLong: boolean, entry: number, sl: number, tp: number, barIndex: number): void {
+    this.state.inTrade = true;
+    this.state.isLong = isLong;
+    this.state.entryPrice = entry;
+    this.state.stopPrice = sl;
+    this.state.targetPrice = tp;
+    this.state.entryBar = barIndex;
   }
 
-  getCurrentPhase(): string {
-    if (this.state.inAccumulation) return 'Accumulation';
-    if (this.state.absorptionCount >= this.params.absorbMinBars) return 'Absorption';
-    return 'Waiting';
-  }
-
-  resetState() {
-    this.state = {
-      absorptionCount: 0,
-      lastAbsorptionBar: 0,
-      inAccumulation: false,
-      accumHigh: null,
-      accumLow: null,
-      accumStartBar: 0,
-      lastSimpleSignalBar: null,
+  private buildSignal(type: 'BUY' | 'SELL', entry: number, sl: number, tp: number, prob: number): SignalResult {
+    const riskPercent = Math.abs((entry - sl) / entry * 100);
+    // Conviction: BUY fires near prob=1, SELL near prob=0 — both are high-confidence.
+    const conviction = type === 'BUY' ? prob : 1 - prob;
+    const score = Math.max(1, Math.min(10, Math.round(conviction * 10)));
+    return {
+      type,
+      entry,
+      sl,
+      tp,
+      risk: riskPercent.toFixed(2),
+      conditions: `Decision-tree long P=${prob.toFixed(4)} (BUY≥${this.params.buyThreshold}, SELL≤${this.params.sellThreshold})`,
+      pattern: 'BTC H4 RR1',
+      phase: type === 'BUY' ? 'LONG' : 'SHORT',
+      isValid: true,
+      score,
     };
   }
 
-  calculateScore(bodyRatio: number, volRatio: number, trendAligned: boolean, hasAbsorption: boolean, inAccumulation: boolean): number {
-    let score = 0;
-
-    // Volume strength (0-2.5): higher volume spike = more conviction
-    if (volRatio >= 3.0) score += 2.5;
-    else if (volRatio >= 2.0) score += 2.0;
-    else if (volRatio >= 1.5) score += 1.5;
-    else score += 0.5;
-
-    // Body strength (0-2.5): fuller candle body = stronger move
-    if (bodyRatio >= 0.85) score += 2.5;
-    else if (bodyRatio >= 0.7) score += 2.0;
-    else if (bodyRatio >= 0.6) score += 1.5;
-    else score += 0.5;
-
-    // Trend alignment (0-2): price above/below EMA20
-    if (trendAligned) score += 2.0;
-    else score += 0.5;
-
-    // 3A pattern quality (0-3): full pattern > partial > simple
-    if (hasAbsorption && inAccumulation) score += 3.0;
-    else if (hasAbsorption) score += 2.0;
-    else if (inAccumulation) score += 1.5;
-    else score += 1.0;
-
-    return Math.min(10, Math.round(score));
+  getCurrentPhase(): string {
+    if (this.state.inTrade) return this.state.isLong ? 'In LONG' : 'In SHORT';
+    return 'Flat';
   }
 
-  private calculateSMA(data: number[], period: number): number[] {
-    const result: number[] = [];
-    for (let i = 0; i < data.length; i++) {
-      if (i < period - 1) {
-        result.push(data[i]);
-      } else {
-        const sum = data.slice(i - period + 1, i + 1).reduce((a, b) => a + b, 0);
-        result.push(sum / period);
-      }
-    }
-    return result;
-  }
-
-  private calculateEMA(data: number[], period: number): number[] {
-    const k = 2 / (period + 1);
-    const result: number[] = [data[0]];
-    for (let i = 1; i < data.length; i++) {
-      result.push(data[i] * k + result[i - 1] * (1 - k));
-    }
-    return result;
-  }
-
-  private calculateATR(candleData: CandleData[], period: number): number[] {
-    const tr: number[] = [];
-    for (let i = 0; i < candleData.length; i++) {
-      if (i === 0) {
-        tr.push(candleData[i].high - candleData[i].low);
-      } else {
-        const high = candleData[i].high;
-        const low = candleData[i].low;
-        const prevClose = candleData[i - 1].close;
-        const tr1 = high - low;
-        const tr2 = Math.abs(high - prevClose);
-        const tr3 = Math.abs(low - prevClose);
-        tr.push(Math.max(tr1, tr2, tr3));
-      }
-    }
-    return this.calculateSMA(tr, period);
+  resetState(): void {
+    this.state = this.freshState();
   }
 }

@@ -1,114 +1,83 @@
-import { SignalDetector3A } from '../signal-detector';
+import { SignalDetectorBTCH4 } from '../signal-detector';
+import { computeFeatures, longProbability, MIN_BARS } from '../btc-h4-model';
 import { CandleData } from '../types';
 
-// Quiet baseline bar: tiny range, tiny volume, flat at `price`.
-function quiet(time: number, price: number, vol = 10): CandleData {
-  return { time, open: price, high: price + 0.5, low: price - 0.5, close: price, volume: vol };
+// Deterministic pseudo-random walk so the model sees realistic BTC-scale bars.
+// Seeded LCG — no Math.random, so the test is reproducible.
+function makeSeries(n: number, start = 60000): CandleData[] {
+  let seed = 123456789;
+  const rand = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed / 0x7fffffff;
+  };
+  const out: CandleData[] = [];
+  let price = start;
+  for (let i = 0; i < n; i++) {
+    const drift = (rand() - 0.5) * 400; // ±200 USD moves
+    const open = price;
+    const close = price + drift;
+    const high = Math.max(open, close) + rand() * 150;
+    const low = Math.min(open, close) - rand() * 150;
+    out.push({ time: i * 4 * 3600, open, high, low, close, volume: 100 + rand() * 500 });
+    price = close;
+  }
+  return out;
 }
 
-// Build N quiet bars at `price` ending at index N-1, then return them.
-function quietSeries(n: number, price = 100, vol = 10): CandleData[] {
-  return Array.from({ length: n }, (_, i) => quiet(i * 60, price, vol));
-}
-
-describe('SignalDetector3A.detectSignals — building signals from candles', () => {
-  test('returns null when fewer than 50 candles are supplied', () => {
-    const det = new SignalDetector3A();
-    expect(det.detectSignals(quietSeries(49))).toBeNull();
+describe('BTC H4 decision-tree model', () => {
+  test('computeFeatures returns null before warmup', () => {
+    expect(computeFeatures(makeSeries(MIN_BARS - 1))).toBeNull();
   });
 
-  test('emits BUY on a high-volume bullish breakout above EMA20', () => {
-    const det = new SignalDetector3A();
-    const bars = quietSeries(59); // bars 0..58 are flat at 100, vol=10
-    // Bar 59: big bullish body, large range, high volume — passes simple-mode gates
-    bars.push({
-      time: 59 * 60,
-      open: 100,
-      high: 103,
-      low: 99.8,
-      close: 102.5,
-      volume: 100,
-    });
-
-    const signal = det.detectSignals(bars);
-    expect(signal).not.toBeNull();
-    expect(signal!.type).toBe('BUY');
-    expect(signal!.entry).toBeCloseTo(102.5, 5);
-    expect(signal!.tp).toBeGreaterThan(signal!.entry);
-    expect(signal!.sl).toBeLessThan(signal!.entry);
-    const risk = parseFloat(signal!.risk);
-    expect(risk).toBeGreaterThan(1);
-    expect(risk).toBeLessThan(5);
-    expect(signal!.score).toBeGreaterThanOrEqual(0);
-    expect(signal!.score).toBeLessThanOrEqual(10);
+  test('computeFeatures returns a feature vector once warmed up', () => {
+    const f = computeFeatures(makeSeries(MIN_BARS + 20));
+    expect(f).not.toBeNull();
+    // Every numeric field must be finite (no NaN/Infinity leaking from divisions).
+    for (const [key, val] of Object.entries(f as unknown as Record<string, number>)) {
+      expect(Number.isFinite(val)).toBe(true);
+    }
   });
 
-  test('emits SELL on a high-volume bearish breakdown below EMA20', () => {
-    const det = new SignalDetector3A();
-    const bars = quietSeries(59);
-    bars.push({
-      time: 59 * 60,
-      open: 100,
-      high: 100.2,
-      low: 97,
-      close: 97.5,
-      volume: 100,
-    });
+  test('longProbability always lands in [0, 1]', () => {
+    // Sweep a range of series lengths so we exercise many different bars.
+    for (let extra = 0; extra <= 60; extra += 5) {
+      const f = computeFeatures(makeSeries(MIN_BARS + extra));
+      if (!f) continue;
+      const p = longProbability(f);
+      expect(p).toBeGreaterThanOrEqual(0);
+      expect(p).toBeLessThanOrEqual(1);
+    }
+  });
+});
 
-    const signal = det.detectSignals(bars);
-    expect(signal).not.toBeNull();
-    expect(signal!.type).toBe('SELL');
-    expect(signal!.entry).toBeCloseTo(97.5, 5);
-    expect(signal!.tp).toBeLessThan(signal!.entry);
-    expect(signal!.sl).toBeGreaterThan(signal!.entry);
-    const risk = parseFloat(signal!.risk);
-    expect(risk).toBeGreaterThan(1);
-    expect(risk).toBeLessThan(5);
+describe('SignalDetectorBTCH4.detectSignals', () => {
+  test('returns null before warmup', () => {
+    const det = new SignalDetectorBTCH4();
+    expect(det.detectSignals(makeSeries(MIN_BARS - 5))).toBeNull();
   });
 
-  test('cooldown: a second qualifying bar within 3 bars of the first hit returns null', () => {
-    const det = new SignalDetector3A();
-    const bars = quietSeries(59);
-
-    // Bar 59 — first BUY hit
-    bars.push({ time: 59 * 60, open: 100, high: 103, low: 99.8, close: 102.5, volume: 100 });
-    const first = det.detectSignals(bars);
-    expect(first).not.toBeNull();
-    expect(first!.type).toBe('BUY');
-
-    // Bar 60 — also qualifies on its own, but cooldown gates it
-    bars.push({ time: 60 * 60, open: 102.5, high: 105.5, low: 102.3, close: 105, volume: 120 });
-    expect(det.detectSignals(bars)).toBeNull();
-
-    // Bar 61 — still within 3-bar cooldown
-    bars.push({ time: 61 * 60, open: 105, high: 108, low: 104.8, close: 107.5, volume: 130 });
-    expect(det.detectSignals(bars)).toBeNull();
-
-    // Bar 62 — gap = 3, cooldown clears, signal allowed again
-    bars.push({ time: 62 * 60, open: 107.5, high: 110, low: 107.3, close: 109.5, volume: 140 });
-    const next = det.detectSignals(bars);
-    expect(next).not.toBeNull();
-    expect(next!.type).toBe('BUY');
-  });
-
-  test('risk filter: rejects signals whose computed risk falls below minSLPercent', () => {
-    const det = new SignalDetector3A();
-    // Tight series — ATR is tiny, so 1.5*ATR SL distance produces <1% risk
-    const bars = quietSeries(59, 100, 10).map((c, i) => ({
-      ...c,
-      // collapse the noise floor so ATR is essentially the breakout bar's TR / 14
-      high: 100.001,
-      low: 99.999,
-    }));
-    bars.push({
-      time: 59 * 60,
-      open: 100,
-      high: 100.05,
-      low: 100.001,
-      close: 100.04,
-      volume: 100,
-    });
-
-    expect(det.detectSignals(bars)).toBeNull();
+  test('any emitted signal has a fixed-distance SL/TP (R:R 1:1)', () => {
+    const dist = 800;
+    const det = new SignalDetectorBTCH4({ tpSlDistance: dist });
+    const bars = makeSeries(300);
+    let emitted: ReturnType<typeof det.detectSignals> = null;
+    // Replay bar-by-bar like CoinMonitor does; capture the first signal.
+    for (let i = MIN_BARS; i <= bars.length; i++) {
+      const sig = det.detectSignals(bars.slice(0, i));
+      if (sig) { emitted = sig; break; }
+    }
+    if (emitted) {
+      expect(Math.abs(emitted.entry - emitted.sl)).toBeCloseTo(dist, 5);
+      expect(Math.abs(emitted.tp - emitted.entry)).toBeCloseTo(dist, 5);
+      if (emitted.type === 'BUY') {
+        expect(emitted.tp).toBeGreaterThan(emitted.entry);
+        expect(emitted.sl).toBeLessThan(emitted.entry);
+      } else {
+        expect(emitted.tp).toBeLessThan(emitted.entry);
+        expect(emitted.sl).toBeGreaterThan(emitted.entry);
+      }
+      expect(emitted.score).toBeGreaterThanOrEqual(1);
+      expect(emitted.score).toBeLessThanOrEqual(10);
+    }
   });
 });
