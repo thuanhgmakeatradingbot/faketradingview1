@@ -1,0 +1,9 @@
+node_modules
+client/node_modules
+client/build
+.git
+dist
+*.md
+.env
+.claude
+.vscode

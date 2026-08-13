@@ -1,0 +1,9 @@
+services:
+  3a-bot:
+    build: .
+    ports:
+      - "3131:3000"
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}

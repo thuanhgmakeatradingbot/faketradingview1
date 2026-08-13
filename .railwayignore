@@ -1,0 +1,10 @@
+node_modules/
+.git/
+.vscode/
+*.html
+test-*.html
+chart-3a.js
+PROJECT.md
+QUICKSTART.md
+SETUP.md
+README.md

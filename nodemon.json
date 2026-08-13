@@ -1,0 +1,7 @@
+{
+  "ignore": ["server/signals.json", "node_modules/", "client/"],
+  "watch": ["server/", "shared/"],
+  "ext": "ts,json",
+  "verbose": true,
+  "exec": "ts-node --project server/tsconfig.json server/server.ts"
+}

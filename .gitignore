@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Environment & secrets
+.env
+.env.*
+config.local.js
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build & coverage
+coverage/
+dist/
+
+# Runtime
+*.pid
+*.seed
