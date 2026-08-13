@@ -10,6 +10,7 @@ import {
   initChatPool, seedIfEmpty, listChats, listEnabledChats,
   addChat, deleteChat, toggleChat, getChat,
 } from './services/chat-pool';
+import { initSettings, getSetting, setSetting, maskToken } from './services/settings';
 import { Signal } from '../shared/types';
 import { formatTimeLog, getTimeframeDurationMs } from '../shared/time';
 import { WinrateStats } from './services/coin-monitor';
@@ -24,6 +25,10 @@ let totalSignalsDetected = 0;
 let refreshCount = 0;
 let isStartupPhase = true;
 let monitors: CoinMonitor[] = [];
+
+// Active bot token — loaded from DB at startup (falls back to env/config),
+// editable at runtime via the admin panel without a restart.
+let activeBotToken = CONFIG.telegram.botToken;
 
 function formatSignalForTelegram(signal: SignalRecord): string {
   const isBuy = signal.type === 'BUY';
@@ -61,7 +66,7 @@ async function broadcast(text: string): Promise<void> {
     return;
   }
   for (const c of chats) {
-    await sendMessage(text, CONFIG.telegram.botToken, c.chat_id, c.thread_id ?? undefined);
+    await sendMessage(text, activeBotToken, c.chat_id, c.thread_id ?? undefined);
   }
 }
 
@@ -136,8 +141,18 @@ function readBody(req: http.IncomingMessage): Promise<any> {
   console.log(`[${formatTimeLog()}] [INIT] Initializing SQLite database...`);
   initDB();
   initChatPool();
+  initSettings();
   // First run: seed the pool with the env chat so signals go somewhere out of the box.
   seedIfEmpty(CONFIG.telegram.chatId, CONFIG.telegram.threadId);
+
+  // Load the bot token from DB if the admin has set one; otherwise keep env/config.
+  const savedToken = getSetting('bot_token');
+  if (savedToken) {
+    activeBotToken = savedToken;
+    console.log(`[${formatTimeLog()}] [INIT] Bot token loaded from DB: ${maskToken(activeBotToken)}`);
+  } else {
+    console.log(`[${formatTimeLog()}] [INIT] Bot token from env/config: ${maskToken(activeBotToken)}`);
+  }
 
   console.log(`[${formatTimeLog()}] [INIT] Chat pool: ${listChats().length} chats total, ${listEnabledChats().length} enabled`);
   console.log(`[${formatTimeLog()}] [INIT] Creating monitors for: ${CONFIG.tokens.join(', ')}`);
@@ -222,10 +237,11 @@ function readBody(req: http.IncomingMessage): Promise<any> {
         });
       }
 
-      // Everything else under /admin and /api/chats requires Basic Auth.
+      // Everything else under /admin and /api/* (except status) requires Basic Auth.
       const isAdminUI = url === '/admin' || url === '/admin/';
       const isChatsAPI = url.startsWith('/api/chats');
-      if (isAdminUI || isChatsAPI) {
+      const isSettingsAPI = url.startsWith('/api/settings');
+      if (isAdminUI || isChatsAPI || isSettingsAPI) {
         if (!requireAuth(req, res)) return;
       }
 
@@ -235,6 +251,26 @@ function readBody(req: http.IncomingMessage): Promise<any> {
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
           res.end(data);
         });
+      }
+
+      // Settings API — bot token
+      if (url === '/api/settings' && method === 'GET') {
+        return sendJSON(res, 200, {
+          botToken: activeBotToken ? maskToken(activeBotToken) : '',
+          hasToken: !!activeBotToken,
+          source: getSetting('bot_token') ? 'db' : 'env',
+        });
+      }
+      if (url === '/api/settings/token' && method === 'POST') {
+        const body = await readBody(req);
+        const token = String(body.token || '').trim();
+        if (!token || !token.includes(':')) {
+          return sendJSON(res, 400, { error: 'Token không hợp lệ (định dạng: 123456:ABC...)' });
+        }
+        setSetting('bot_token', token);
+        activeBotToken = token;
+        console.log(`[${formatTimeLog()}] [SETTINGS] Bot token updated via admin: ${maskToken(token)}`);
+        return sendJSON(res, 200, { ok: true, botToken: maskToken(token) });
       }
 
       // Chat pool API
@@ -266,7 +302,7 @@ function readBody(req: http.IncomingMessage): Promise<any> {
           try {
             await sendMessage(
               `🧪 Test từ PHƯỚC BÁU Bot\n\nNếu bạn thấy tin này, chat "${c.name}" đã được cấu hình đúng ✅`,
-              CONFIG.telegram.botToken, c.chat_id, c.thread_id ?? undefined
+              activeBotToken, c.chat_id, c.thread_id ?? undefined
             );
             return sendJSON(res, 200, { ok: true });
           } catch (e: any) {

@@ -64,6 +64,18 @@
 <div class="status-line" id="status">Loading…</div>
 
 <div class="card">
+  <h2 style="margin-top:0">🤖 Bot Token</h2>
+  <div class="status-line" id="token-current" style="margin-bottom:10px">Đang tải token…</div>
+  <form id="token-form">
+    <input name="token" placeholder="Dán bot token mới (vd: 123456:ABC-DEF...)" required />
+    <button type="submit">Lưu token</button>
+  </form>
+  <div style="color:#6b7280;font-size:12px;margin-top:8px">
+    Lấy token từ @BotFather trên Telegram. Token áp dụng ngay, không cần restart.
+  </div>
+</div>
+
+<div class="card">
   <h2 style="margin-top:0">➕ Thêm chat</h2>
   <form id="add-form">
     <input name="chat_id" placeholder="Chat ID (vd: -1002990350274)" required />
@@ -109,6 +121,17 @@ async function loadStatus() {
     const s = await api('/api/status');
     $('status').textContent = `🟢 Bot đang chạy · ${s.tokens.join(', ')} · ${s.signals} tín hiệu đã phát hiện`;
   } catch (e) { $('status').textContent = '🔴 ' + e.message; }
+}
+
+async function loadToken() {
+  try {
+    const s = await api('/api/settings');
+    if (s.hasToken) {
+      $('token-current').textContent = `Hiện tại: ${s.botToken}  (nguồn: ${s.source === 'db' ? 'đã lưu' : 'env/config'})`;
+    } else {
+      $('token-current').textContent = '⚠️ Chưa có token — bot không gửi được tin!';
+    }
+  } catch (e) { $('token-current').textContent = '🔴 ' + e.message; }
 }
 
 async function loadChats() {
@@ -176,7 +199,20 @@ $('add-form').addEventListener('submit', async (e) => {
   } catch (err) { toast(err.message, 'err'); }
 });
 
+$('token-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const token = fd.get('token').toString().trim();
+  try {
+    await api('/api/settings/token', { method: 'POST', body: JSON.stringify({ token }) });
+    toast('✓ Đã lưu bot token');
+    e.target.reset();
+    loadToken();
+  } catch (err) { toast(err.message, 'err'); }
+});
+
 loadStatus();
+loadToken();
 loadChats();
 setInterval(loadStatus, 30000);
 </script>
