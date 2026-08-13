@@ -6,8 +6,12 @@ import CONFIG from './config';
 import CoinMonitor from './services/coin-monitor';
 import { sendMessage } from './services/telegram';
 import { initDB, getLatestSignals } from './services/signal-db';
+import {
+  initChatPool, seedIfEmpty, listChats, listEnabledChats,
+  addChat, deleteChat, toggleChat, getChat,
+} from './services/chat-pool';
 import { Signal } from '../shared/types';
-import { formatTimeLog, formatTimeTelegram, getTimeframeDurationMs, now } from '../shared/time';
+import { formatTimeLog, getTimeframeDurationMs } from '../shared/time';
 import { WinrateStats } from './services/coin-monitor';
 
 interface SignalRecord extends Signal {
@@ -18,25 +22,10 @@ interface SignalRecord extends Signal {
 
 let totalSignalsDetected = 0;
 let refreshCount = 0;
-let allSignals: SignalRecord[] = [];
 let isStartupPhase = true;
-let startupSignals: SignalRecord[] = [];
 let monitors: CoinMonitor[] = [];
 
-function getAggregatedWinrate(): WinrateStats {
-  const agg: WinrateStats = { total: 0, tp1Hit: 0, tp2Hit: 0, tp3Hit: 0, slHit: 0, pending: 0 };
-  for (const m of monitors) {
-    agg.total += m.winrateStats.total;
-    agg.tp1Hit += m.winrateStats.tp1Hit;
-    agg.tp2Hit += m.winrateStats.tp2Hit;
-    agg.tp3Hit += m.winrateStats.tp3Hit;
-    agg.slHit += m.winrateStats.slHit;
-    agg.pending += m.winrateStats.pending;
-  }
-  return agg;
-}
-
-function formatSignalForTelegram(signal: SignalRecord, stats: WinrateStats, coin: string): string {
+function formatSignalForTelegram(signal: SignalRecord): string {
   const isBuy = signal.type === 'BUY';
   const directionIcon = isBuy ? '🟢' : '🔴';
   const directionText = isBuy ? 'BUY' : 'SELL';
@@ -50,7 +39,6 @@ function formatSignalForTelegram(signal: SignalRecord, stats: WinrateStats, coin
   const tp2 = tp1 + dir * extra;
   const tp3 = tp2 + dir * extra;
 
-  // "PHƯỚC BÁU" format (ported from the Pine telegram_payload).
   let message = `📌 PHƯỚC BÁU SIGNAL\n━━━━━━━━━━━\n\n`;
   message += `${directionIcon} ${directionText} ${symbolClean}\n`;
   message += `📍 Entry: ${entry.toFixed(2)}\n`;
@@ -65,24 +53,27 @@ function formatSignalForTelegram(signal: SignalRecord, stats: WinrateStats, coin
   return message;
 }
 
-function findMonitor(symbol: string): CoinMonitor | undefined {
-  return monitors.find(m => m.symbol === symbol);
+/** Fan out one message to every enabled chat in the pool. */
+async function broadcast(text: string): Promise<void> {
+  const chats = listEnabledChats();
+  if (chats.length === 0) {
+    console.log(`[${formatTimeLog()}] [BROADCAST] No enabled chats in pool — skipping`);
+    return;
+  }
+  for (const c of chats) {
+    await sendMessage(text, CONFIG.telegram.botToken, c.chat_id, c.thread_id ?? undefined);
+  }
 }
 
 async function handleSignalDetected(signal: SignalRecord): Promise<void> {
   totalSignalsDetected++;
-  allSignals.push(signal);
 
   console.log(`[${formatTimeLog()}] [SIGNAL #${totalSignalsDetected}] ${signal.type} ${signal.symbol} ${signal.timeframe} @ $${signal.entry.toFixed(2)}`);
 
-  if (isStartupPhase) {
-    startupSignals.push(signal);
-    return;
-  }
+  if (isStartupPhase) return;
 
-  // Don't send stale signals to Telegram — the candle must have closed
-  // within 1 candle-period ago (e.g. ≤1h for 1H, ≤4h for 4H).
-  // The signal is still saved to DB for winrate history.
+  // Don't send stale signals to Telegram — the candle must have closed within
+  // 1 candle-period ago. Still saved to DB for winrate history upstream.
   const candleCloseTime = signal.timestamp + getTimeframeDurationMs(signal.timeframe);
   const stalenessMs = Date.now() - candleCloseTime;
   const maxStalenessMs = getTimeframeDurationMs(signal.timeframe);
@@ -92,17 +83,63 @@ async function handleSignalDetected(signal: SignalRecord): Promise<void> {
     return;
   }
 
-  const mon = findMonitor(signal.symbol);
-  const stats = mon ? mon.winrateStats : getAggregatedWinrate();
-  const coin = mon ? mon.coin : signal.symbol.replace('-USDT-SWAP', '');
-  const message = formatSignalForTelegram(signal, stats, coin);
-  await sendMessage(message, CONFIG.telegram.botToken, CONFIG.telegram.chatId, CONFIG.telegram.threadId);
+  await broadcast(formatSignalForTelegram(signal));
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// HTTP helpers — auth + JSON body
+// ────────────────────────────────────────────────────────────────────────────
+
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASS = process.env.ADMIN_PASS || 'phuocbau2026';
+
+function checkBasicAuth(req: http.IncomingMessage): boolean {
+  const header = req.headers['authorization'];
+  if (!header || !header.startsWith('Basic ')) return false;
+  try {
+    const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+    const idx = decoded.indexOf(':');
+    if (idx < 0) return false;
+    return decoded.slice(0, idx) === ADMIN_USER && decoded.slice(idx + 1) === ADMIN_PASS;
+  } catch { return false; }
+}
+
+function requireAuth(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+  if (checkBasicAuth(req)) return true;
+  res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Phuoc Bau Admin"' });
+  res.end('Unauthorized');
+  return false;
+}
+
+function sendJSON(res: http.ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+
+function readBody(req: http.IncomingMessage): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', chunk => raw += chunk);
+    req.on('end', () => {
+      if (!raw) return resolve({});
+      try { resolve(JSON.parse(raw)); }
+      catch { reject(new Error('Invalid JSON')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+
 (async () => {
-  console.log(`[START BOT] [${formatTimeLog()}] 3A Strategy Trading System Starting...`);
+  console.log(`[START BOT] [${formatTimeLog()}] PHUOC BAU BTC H4 Bot Starting...`);
   console.log(`[${formatTimeLog()}] [INIT] Initializing SQLite database...`);
   initDB();
+  initChatPool();
+  // First run: seed the pool with the env chat so signals go somewhere out of the box.
+  seedIfEmpty(CONFIG.telegram.chatId, CONFIG.telegram.threadId);
+
+  console.log(`[${formatTimeLog()}] [INIT] Chat pool: ${listChats().length} chats total, ${listEnabledChats().length} enabled`);
   console.log(`[${formatTimeLog()}] [INIT] Creating monitors for: ${CONFIG.tokens.join(', ')}`);
 
   CONFIG.tokens.forEach(coin => {
@@ -111,49 +148,34 @@ async function handleSignalDetected(signal: SignalRecord): Promise<void> {
     console.log(`[${formatTimeLog()}] [INIT] Monitor for ${coin} created`);
   });
 
-  // Start monitors sequentially, collect their latest signals
   for (let i = 0; i < monitors.length; i++) {
     await new Promise(resolve => setTimeout(resolve, 1000));
     try {
-      const latest = await monitors[i].start();
-      startupSignals.push(...latest);
+      await monitors[i].start();
     } catch (err: any) {
       console.error(`[${formatTimeLog()}] [INIT ERROR] ${monitors[i].symbol}: ${err.message} — skipping startup scan, cron will retry`);
     }
   }
 
-  // All monitors done scanning. Startup summary to Telegram is disabled —
-  // only real signals are pushed.
   isStartupPhase = false;
-  startupSignals = [];
 
-  // Fire at HH:00:01 every hour. The model is BTC H4-only, so we only scan when
-  // a 4H candle has just closed. 4H candles (UTC-aligned) close every 4 UTC hours
-  // (00:00, 04:00, 08:00, ...); detect that via utcHour % 4 === 0.
   cron.schedule('1 0 * * * *', async () => {
     const utcHour = new Date().getUTCHours();
-    const is4HClose = utcHour % 4 === 0;
-    if (!is4HClose) {
-      // Not a 4H boundary — nothing to do for a 4H-only strategy.
-      return;
-    }
+    if (utcHour % 4 !== 0) return;
     const timeframesToScan = ['4H'];
 
     console.log(`[${refreshCount}] [${formatTimeLog()}] 4H candle closed — scanning ${timeframesToScan.join(', ')}...`);
 
     let totalSaved = 0;
     for (const monitor of monitors) {
-      try {
-        await monitor.refreshData();
-      } catch (err: any) {
+      try { await monitor.refreshData(); }
+      catch (err: any) {
         console.error(`[${formatTimeLog()}] [REFRESH ERROR] ${monitor.symbol}: ${err.message} — skipping this tick`);
         continue;
       }
       const { newlySaved } = monitor.replayAllSignalsToDB(false, timeframesToScan);
       totalSaved += newlySaved.length;
-      for (const sig of newlySaved) {
-        await handleSignalDetected(sig as SignalRecord);
-      }
+      for (const sig of newlySaved) await handleSignalDetected(sig as SignalRecord);
     }
 
     console.log(`[${refreshCount}] [${formatTimeLog()}] Refresh completed (+${totalSaved} new signals to DB)`);
@@ -171,67 +193,117 @@ async function handleSignalDetected(signal: SignalRecord): Promise<void> {
         );
       });
     }
-
     refreshCount++;
   });
 
-  // HTTP server — serves client static files + /api/status
+  // Look for admin.html next to this source file first (ts-node) — fall back to
+  // server/admin.html relative to the cwd (works when running from dist/).
+  const ADMIN_HTML_PATH = fs.existsSync(path.resolve(__dirname, 'admin.html'))
+    ? path.resolve(__dirname, 'admin.html')
+    : path.resolve(process.cwd(), 'server/admin.html');
   const CLIENT_BUILD = path.resolve(__dirname, '../client/build');
   const MIME_TYPES: Record<string, string> = {
-    '.html': 'text/html',
-    '.js': 'application/javascript',
-    '.css': 'text/css',
-    '.json': 'application/json',
-    '.png': 'image/png',
-    '.jpg': 'image/jpeg',
-    '.svg': 'image/svg+xml',
-    '.ico': 'image/x-icon',
-    '.woff': 'font/woff',
-    '.woff2': 'font/woff2',
+    '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css',
+    '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg',
+    '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
+    '.woff': 'font/woff', '.woff2': 'font/woff2',
   };
 
-  const server = http.createServer((req, res) => {
-    if (req.url === '/api/status') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        status: 'running',
-        tokens: CONFIG.tokens,
-        monitors: monitors.length,
-        signals: totalSignalsDetected,
-      }));
-      return;
-    }
+  const server = http.createServer(async (req, res) => {
+    const url = req.url || '/';
+    const method = req.method || 'GET';
 
-    let filePath = path.join(CLIENT_BUILD, req.url === '/' ? 'index.html' : req.url!);
-    const ext = path.extname(filePath).toLowerCase();
-
-    fs.readFile(filePath, (err, data) => {
-      if (err) {
-        // SPA fallback: serve index.html for client-side routes
-        fs.readFile(path.join(CLIENT_BUILD, 'index.html'), (e2, d2) => {
-          if (e2) {
-            res.writeHead(404);
-            res.end('Not found');
-            return;
-          }
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end(d2);
+    try {
+      // Public: bot status (safe read, no secrets).
+      if (url === '/api/status') {
+        return sendJSON(res, 200, {
+          status: 'running', tokens: CONFIG.tokens,
+          monitors: monitors.length, signals: totalSignalsDetected,
         });
-        return;
       }
-      res.writeHead(200, { 'Content-Type': MIME_TYPES[ext] || 'application/octet-stream' });
-      res.end(data);
-    });
+
+      // Everything else under /admin and /api/chats requires Basic Auth.
+      const isAdminUI = url === '/admin' || url === '/admin/';
+      const isChatsAPI = url.startsWith('/api/chats');
+      if (isAdminUI || isChatsAPI) {
+        if (!requireAuth(req, res)) return;
+      }
+
+      if (isAdminUI) {
+        return fs.readFile(ADMIN_HTML_PATH, (err, data) => {
+          if (err) { res.writeHead(500); return res.end('admin.html not found'); }
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(data);
+        });
+      }
+
+      // Chat pool API
+      if (url === '/api/chats' && method === 'GET') {
+        return sendJSON(res, 200, listChats());
+      }
+      if (url === '/api/chats' && method === 'POST') {
+        const body = await readBody(req);
+        if (!body.chat_id || !body.name) return sendJSON(res, 400, { error: 'chat_id và name là bắt buộc' });
+        const created = addChat(String(body.chat_id), String(body.name), body.thread_id ?? undefined);
+        if (!created) return sendJSON(res, 409, { error: 'Chat đã tồn tại' });
+        return sendJSON(res, 201, created);
+      }
+      const chatIdMatch = url.match(/^\/api\/chats\/(\d+)(\/toggle|\/test)?$/);
+      if (chatIdMatch) {
+        const id = parseInt(chatIdMatch[1], 10);
+        const action = chatIdMatch[2];
+        if (method === 'DELETE' && !action) {
+          const ok = deleteChat(id);
+          return sendJSON(res, ok ? 200 : 404, { ok });
+        }
+        if (method === 'POST' && action === '/toggle') {
+          const updated = toggleChat(id);
+          return sendJSON(res, updated ? 200 : 404, updated ?? { error: 'not found' });
+        }
+        if (method === 'POST' && action === '/test') {
+          const c = getChat(id);
+          if (!c) return sendJSON(res, 404, { ok: false, error: 'not found' });
+          try {
+            await sendMessage(
+              `🧪 Test từ PHƯỚC BÁU Bot\n\nNếu bạn thấy tin này, chat "${c.name}" đã được cấu hình đúng ✅`,
+              CONFIG.telegram.botToken, c.chat_id, c.thread_id ?? undefined
+            );
+            return sendJSON(res, 200, { ok: true });
+          } catch (e: any) {
+            return sendJSON(res, 500, { ok: false, error: e.message });
+          }
+        }
+      }
+
+      // Fallback: serve React client build if present (unchanged).
+      const filePath = path.join(CLIENT_BUILD, url === '/' ? 'index.html' : url);
+      const ext = path.extname(filePath).toLowerCase();
+      fs.readFile(filePath, (err, data) => {
+        if (err) {
+          fs.readFile(path.join(CLIENT_BUILD, 'index.html'), (e2, d2) => {
+            if (e2) { res.writeHead(404); return res.end('Not found — try /admin'); }
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end(d2);
+          });
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': MIME_TYPES[ext] || 'application/octet-stream' });
+        res.end(data);
+      });
+    } catch (err: any) {
+      console.error(`[${formatTimeLog()}] [HTTP ERROR] ${method} ${url}: ${err.message}`);
+      if (!res.headersSent) sendJSON(res, 500, { error: err.message });
+    }
   });
 
   const PORT = process.env.PORT || 3000;
   server.listen(PORT, () => {
     console.log(`[${formatTimeLog()}] Server listening on port ${PORT}`);
+    console.log(`[${formatTimeLog()}] Admin UI: http://localhost:${PORT}/admin (user: ${ADMIN_USER})`);
   });
 
   async function shutdownHandler(signalName: string) {
     console.log(`[END BOT] [${formatTimeLog()}] Shutting down (${signalName})...`);
-    // Start/stop Telegram notifications are disabled — no message sent on shutdown.
     server.close();
     monitors.forEach(m => m.stop());
     process.exit(0);
@@ -239,13 +311,11 @@ async function handleSignalDetected(signal: SignalRecord): Promise<void> {
 
   process.on('SIGINT', () => shutdownHandler('SIGINT'));
   process.on('SIGTERM', () => shutdownHandler('SIGTERM'));
-
   process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error.message);
     console.error(error.stack);
     setTimeout(() => process.exit(1), 1000);
   });
-
   process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection at:', promise, 'reason:', reason);
   });

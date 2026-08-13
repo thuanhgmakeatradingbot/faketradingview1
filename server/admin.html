@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PHƯỚC BÁU — Bot Admin</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0; padding: 24px; max-width: 900px; margin: 0 auto;
+    background: #0f1419; color: #e6e8eb;
+  }
+  h1 { margin-top: 0; font-size: 22px; }
+  h2 { font-size: 16px; color: #9aa4b2; margin-top: 32px; }
+  .card {
+    background: #1a2029; border: 1px solid #2a323d; border-radius: 8px;
+    padding: 16px; margin-bottom: 12px;
+  }
+  input, button {
+    font-size: 14px; padding: 8px 12px; border-radius: 6px;
+    border: 1px solid #3a4553; background: #0f1419; color: #e6e8eb;
+  }
+  button {
+    cursor: pointer; background: #2563eb; border-color: #2563eb; color: white;
+  }
+  button:hover { background: #1d4ed8; }
+  button.danger { background: #dc2626; border-color: #dc2626; }
+  button.danger:hover { background: #b91c1c; }
+  button.ghost { background: transparent; color: #9aa4b2; border-color: #3a4553; }
+  button.ghost:hover { background: #1a2029; color: #e6e8eb; }
+  form { display: flex; gap: 8px; flex-wrap: wrap; }
+  form input { flex: 1; min-width: 140px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #2a323d; font-size: 14px; }
+  th { color: #9aa4b2; font-weight: 500; font-size: 12px; text-transform: uppercase; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 600;
+  }
+  .badge.on { background: rgba(34,197,94,.2); color: #4ade80; }
+  .badge.off { background: rgba(239,68,68,.2); color: #f87171; }
+  .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .row-actions button { padding: 4px 10px; font-size: 12px; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+  .toast {
+    position: fixed; top: 20px; right: 20px; padding: 12px 16px;
+    border-radius: 8px; background: #1e293b; border: 1px solid #334155;
+    color: #e6e8eb; font-size: 13px; z-index: 100;
+    transform: translateX(400px); transition: transform .2s;
+  }
+  .toast.show { transform: translateX(0); }
+  .toast.ok { border-color: #22c55e; }
+  .toast.err { border-color: #ef4444; }
+  .empty { color: #6b7280; text-align: center; padding: 24px; font-style: italic; }
+  .status-line { color: #9aa4b2; font-size: 12px; margin-bottom: 20px; }
+</style>
+</head>
+<body>
+<div id="toast" class="toast"></div>
+
+<h1>📌 PHƯỚC BÁU Bot — Chat Pool</h1>
+<div class="status-line" id="status">Loading…</div>
+
+<div class="card">
+  <h2 style="margin-top:0">➕ Thêm chat</h2>
+  <form id="add-form">
+    <input name="chat_id" placeholder="Chat ID (vd: -1002990350274)" required />
+    <input name="name" placeholder="Tên (vd: VIP Group)" required />
+    <input name="thread_id" placeholder="Thread ID (topic, để trống nếu ko có)" type="number" />
+    <button type="submit">Thêm</button>
+  </form>
+</div>
+
+<h2>📋 Danh sách chat</h2>
+<div class="card" style="padding:0">
+  <table>
+    <thead>
+      <tr>
+        <th>#</th><th>Tên</th><th>Chat ID</th><th>Topic</th><th>Trạng thái</th><th></th>
+      </tr>
+    </thead>
+    <tbody id="chat-list"></tbody>
+  </table>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const toast = (msg, kind='ok') => {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + kind;
+  setTimeout(() => t.className = 'toast ' + kind, 2500);
+};
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+  });
+  const body = res.headers.get('content-type')?.includes('json') ? await res.json() : null;
+  if (!res.ok) throw new Error(body?.error || res.statusText);
+  return body;
+}
+
+async function loadStatus() {
+  try {
+    const s = await api('/api/status');
+    $('status').textContent = `🟢 Bot đang chạy · ${s.tokens.join(', ')} · ${s.signals} tín hiệu đã phát hiện`;
+  } catch (e) { $('status').textContent = '🔴 ' + e.message; }
+}
+
+async function loadChats() {
+  const tbody = $('chat-list');
+  try {
+    const chats = await api('/api/chats');
+    if (chats.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">Chưa có chat nào — thêm bên trên</td></tr>';
+      return;
+    }
+    tbody.innerHTML = chats.map(c => `
+      <tr>
+        <td>${c.id}</td>
+        <td>${escapeHtml(c.name)}</td>
+        <td class="mono">${escapeHtml(c.chat_id)}</td>
+        <td class="mono">${c.thread_id ?? '—'}</td>
+        <td><span class="badge ${c.enabled ? 'on' : 'off'}">${c.enabled ? 'BẬT' : 'TẮT'}</span></td>
+        <td class="row-actions">
+          <button onclick="doToggle(${c.id})" class="ghost">${c.enabled ? 'Tắt' : 'Bật'}</button>
+          <button onclick="doTest(${c.id})">Test</button>
+          <button onclick="doDelete(${c.id})" class="danger">Xoá</button>
+        </td>
+      </tr>
+    `).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty">Lỗi: ${e.message}</td></tr>`;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function doToggle(id) {
+  try { await api('/api/chats/' + id + '/toggle', { method: 'POST' }); toast('Đã đổi trạng thái'); loadChats(); }
+  catch (e) { toast(e.message, 'err'); }
+}
+
+async function doTest(id) {
+  try {
+    const res = await api('/api/chats/' + id + '/test', { method: 'POST' });
+    toast(res.ok ? '✓ Đã gửi tin test' : '✗ Telegram không nhận: ' + (res.error || 'unknown'), res.ok ? 'ok' : 'err');
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function doDelete(id) {
+  if (!confirm('Xoá chat này khỏi pool?')) return;
+  try { await api('/api/chats/' + id, { method: 'DELETE' }); toast('Đã xoá'); loadChats(); }
+  catch (e) { toast(e.message, 'err'); }
+}
+
+$('add-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = {
+    chat_id: fd.get('chat_id').toString().trim(),
+    name: fd.get('name').toString().trim(),
+    thread_id: fd.get('thread_id') ? parseInt(fd.get('thread_id').toString(), 10) : null,
+  };
+  try {
+    await api('/api/chats', { method: 'POST', body: JSON.stringify(body) });
+    toast('Đã thêm');
+    e.target.reset();
+    loadChats();
+  } catch (err) { toast(err.message, 'err'); }
+});
+
+loadStatus();
+loadChats();
+setInterval(loadStatus, 30000);
+</script>
+</body>
+</html>
