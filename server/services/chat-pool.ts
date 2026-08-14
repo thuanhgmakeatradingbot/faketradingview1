@@ -71,6 +71,34 @@ export function deleteChat(id: number): boolean {
   return res.changes > 0;
 }
 
+export interface UpdateChatFields {
+  name?: string;
+  thread_id?: number | null;
+}
+
+/**
+ * Update a chat's name and/or topic (thread) id. Returns the updated row, or
+ * throws 'DUPLICATE' if the new (chat_id, thread_id) collides with another chat.
+ */
+export function updateChat(id: number, fields: UpdateChatFields): ChatEntry | null {
+  const db = getDB();
+  const current = getChat(id);
+  if (!current) return null;
+
+  const name = fields.name !== undefined ? fields.name : current.name;
+  const threadId = fields.thread_id !== undefined ? fields.thread_id : current.thread_id;
+
+  // Guard the unique (chat_id, IFNULL(thread_id,-1)) index before writing.
+  const clash = db.prepare(`
+    SELECT id FROM chats
+    WHERE chat_id = ? AND IFNULL(thread_id, -1) = IFNULL(?, -1) AND id != ?
+  `).get(current.chat_id, threadId, id) as { id: number } | undefined;
+  if (clash) throw new Error('DUPLICATE');
+
+  db.prepare('UPDATE chats SET name = ?, thread_id = ? WHERE id = ?').run(name, threadId, id);
+  return getChat(id);
+}
+
 export function toggleChat(id: number): ChatEntry | null {
   const db = getDB();
   db.prepare('UPDATE chats SET enabled = 1 - enabled WHERE id = ?').run(id);

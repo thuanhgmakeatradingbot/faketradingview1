@@ -8,7 +8,7 @@ import { sendMessage } from './services/telegram';
 import { initDB, getLatestSignals } from './services/signal-db';
 import {
   initChatPool, seedIfEmpty, listChats, listEnabledChats,
-  addChat, deleteChat, toggleChat, getChat,
+  addChat, deleteChat, toggleChat, getChat, updateChat,
 } from './services/chat-pool';
 import { initSettings, getSetting, setSetting, maskToken } from './services/settings';
 import { Signal } from '../shared/types';
@@ -284,7 +284,7 @@ function readBody(req: http.IncomingMessage): Promise<any> {
         if (!created) return sendJSON(res, 409, { error: 'Chat đã tồn tại' });
         return sendJSON(res, 201, created);
       }
-      const chatIdMatch = url.match(/^\/api\/chats\/(\d+)(\/toggle|\/test)?$/);
+      const chatIdMatch = url.match(/^\/api\/chats\/(\d+)(\/toggle|\/test|\/update)?$/);
       if (chatIdMatch) {
         const id = parseInt(chatIdMatch[1], 10);
         const action = chatIdMatch[2];
@@ -295,6 +295,26 @@ function readBody(req: http.IncomingMessage): Promise<any> {
         if (method === 'POST' && action === '/toggle') {
           const updated = toggleChat(id);
           return sendJSON(res, updated ? 200 : 404, updated ?? { error: 'not found' });
+        }
+        if (method === 'POST' && action === '/update') {
+          const body = await readBody(req);
+          const fields: { name?: string; thread_id?: number | null } = {};
+          if (body.name !== undefined) fields.name = String(body.name).trim();
+          if (body.thread_id !== undefined) {
+            // Empty string / null → clear the topic; otherwise parse as int.
+            fields.thread_id = (body.thread_id === null || body.thread_id === '')
+              ? null
+              : parseInt(String(body.thread_id), 10);
+          }
+          try {
+            const updated = updateChat(id, fields);
+            return sendJSON(res, updated ? 200 : 404, updated ?? { error: 'not found' });
+          } catch (e: any) {
+            if (e.message === 'DUPLICATE') {
+              return sendJSON(res, 409, { error: 'Đã có chat khác với cùng Chat ID + Topic này' });
+            }
+            return sendJSON(res, 500, { error: e.message });
+          }
         }
         if (method === 'POST' && action === '/test') {
           const c = getChat(id);

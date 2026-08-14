@@ -134,10 +134,12 @@ async function loadToken() {
   } catch (e) { $('token-current').textContent = '🔴 ' + e.message; }
 }
 
+let currentChats = [];
 async function loadChats() {
   const tbody = $('chat-list');
   try {
     const chats = await api('/api/chats');
+    currentChats = chats;
     if (chats.length === 0) {
       tbody.innerHTML = '<tr><td colspan="6" class="empty">Chưa có chat nào — thêm bên trên</td></tr>';
       return;
@@ -150,6 +152,7 @@ async function loadChats() {
         <td class="mono">${c.thread_id ?? '—'}</td>
         <td><span class="badge ${c.enabled ? 'on' : 'off'}">${c.enabled ? 'BẬT' : 'TẮT'}</span></td>
         <td class="row-actions">
+          <button onclick="doEdit(${c.id})" class="ghost">Sửa</button>
           <button onclick="doToggle(${c.id})" class="ghost">${c.enabled ? 'Tắt' : 'Bật'}</button>
           <button onclick="doTest(${c.id})">Test</button>
           <button onclick="doDelete(${c.id})" class="danger">Xoá</button>
@@ -168,6 +171,24 @@ function escapeHtml(s) {
 async function doToggle(id) {
   try { await api('/api/chats/' + id + '/toggle', { method: 'POST' }); toast('Đã đổi trạng thái'); loadChats(); }
   catch (e) { toast(e.message, 'err'); }
+}
+
+async function doEdit(id) {
+  const c = currentChats.find(x => x.id === id);
+  if (!c) return;
+  const name = prompt('Tên chat:', c.name);
+  if (name === null) return; // cancelled
+  const topicRaw = prompt('Topic / Thread ID (để trống nếu không có):', c.thread_id ?? '');
+  if (topicRaw === null) return; // cancelled
+  const body = {
+    name: name.trim(),
+    thread_id: topicRaw.trim() === '' ? null : topicRaw.trim(),
+  };
+  try {
+    await api('/api/chats/' + id + '/update', { method: 'POST', body: JSON.stringify(body) });
+    toast('✓ Đã cập nhật');
+    loadChats();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 async function doTest(id) {
