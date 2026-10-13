@@ -4,6 +4,11 @@ import { formatTimeLog } from '../../shared/time';
 import OKXClient from './okx-client';
 import { saveSignal, loadSignals, updateSignalResult, DBSignal } from './signal-db';
 
+// Match the Pine default `window_bars = 5000`. One extra candle is fetched
+// because the final OKX candle is the currently-forming one and is excluded
+// before signals are evaluated.
+const PINE_LOOKBACK_BARS = 5000;
+
 export interface WinrateStats {
   total: number;
   tp1Hit: number;
@@ -61,12 +66,14 @@ class CoinMonitor {
 
   async fetchHistoricalData(): Promise<void> {
     try {
-      // Fetch 300 4H candles directly — the model needs EMA200 + lookback[34]
-      // warmup, so aggregating from 300 1H bars (only ~75 4H) is not enough.
-      const candles4H = await this.okxClient.getCandles(this.symbol, '4H', '300');
+      const candles4H = await this.okxClient.getCandleHistory(
+        this.symbol,
+        '4H',
+        PINE_LOOKBACK_BARS + 1,
+      );
       this.data['4H'] = candles4H;
 
-      console.log(`[${formatTimeLog()}] [FETCH] ${this.symbol}: ${candles4H.length} 4H candles`);
+      console.log(`[${formatTimeLog()}] [FETCH] ${this.symbol}: ${candles4H.length} H4 candles (lookback ${PINE_LOOKBACK_BARS})`);
     } catch (error: any) {
       // Re-throw so callers know the fetch failed — don't silently leave
       // this.data empty, which would cause the replay to skip all timeframes
